@@ -114,7 +114,7 @@ void loop() // run over and over again
       }
 
       // Now log the new data to the gpx file
-      if (gpx_open) {
+      if (gpx_open && GPS.fix && strstr(GPS.lastNMEA(), "$GPGGA")) {
         write_trkpt_to_gpx();
         PRINT_GPX(gpx);
       }
@@ -180,7 +180,10 @@ char *convert_coord(double nmea, char compass, char *s) {
   dec_deg = deg + dec_deg;
   if (compass == 'S' || compass == 'W')
     dec_deg = -1 * dec_deg;
-  return(dtostrf(dec_deg, 12, 7, s));
+  s = dtostrf(dec_deg, 12, 7, s);
+  while (*s == ' ')
+    s++;
+  return(s);
 }
 
 void write_to_gpx(const char *s) {
@@ -192,13 +195,13 @@ void write_to_gpx(const char *s) {
     gpx.write(s, l);
     Serial.print("Wrote: "); Serial.println(l);
     Serial.print(s);
-    Serial.print("Position: "); Serial.println(gpx.position());
+    // Serial.print("Position: "); Serial.println(gpx.position());
     l = strlen(gpxtail);
     gpx.write(gpxtail, l);
-    Serial.print("Wrote: "); Serial.println(l);
-    Serial.print("Position: "); Serial.println(gpx.position());
+    // Serial.print("Wrote: "); Serial.println(l);
+    // Serial.print("Position: "); Serial.println(gpx.position());
     gpx.seek(gpx.position() - l);
-    Serial.print("Seeking, position: "); Serial.println(gpx.position());
+    // Serial.print("Seeking, position: "); Serial.println(gpx.position());
     gpx.flush();
 
   } else {
