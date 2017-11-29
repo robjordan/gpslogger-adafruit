@@ -51,6 +51,7 @@ void print_GPS();
 char *dtostrf(double __val,signed char __width,unsigned char __prec,char * __s);
 char *convert_coord(double nmea, char compass, char *s);
 char *dtostrf(double val, int width, unsigned int prec, char *sout);
+void dateTime(uint16_t* date, uint16_t* time);
 
 void setup()
 {
@@ -108,6 +109,7 @@ void loop() // run over and over again
       
       // We have received and parsed a sentence. Does it have date? If we haven't created a dated GPX file, create it now
       if (!gpx_open && GPS.fix && GPS.year) {
+        SdFile::dateTimeCallback(dateTime);
         if (create_gpx ())
           gpx_open = TRUE;
           PRINT_GPX(gpx);
@@ -357,5 +359,15 @@ char *dtostrf(double val, int width, unsigned int prec, char *sout) {
   }
   *p = 0;
   return sout;
+}
+
+// call back for file timestamps
+void dateTime(uint16_t* date, uint16_t* time) {
+
+ // return date using FAT_DATE macro to format fields
+ *date = FAT_DATE(GPS.year+2000, GPS.month, GPS.day);
+
+ // return time using FAT_TIME macro to format fields
+ *time = FAT_TIME(GPS.hour, GPS.minute, GPS.seconds);
 }
 
