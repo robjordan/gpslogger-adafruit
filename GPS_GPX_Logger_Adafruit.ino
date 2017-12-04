@@ -9,6 +9,7 @@
 #include <SD.h>
 #include <stdlib.h>
 #include <string.h>
+#include <RTCZero.h>
 
 #define FALSE 0
 #define TRUE (!FALSE)
@@ -48,6 +49,8 @@ Sd2Card card;
 SdVolume volume;
 SdFile root;
 const int chipSelect = 4;
+RTCZero rtc;
+int AlarmTime;
 
 // Pre-declare functions other than those returning int
 File create_gpx();
@@ -66,11 +69,14 @@ void GPS_setup();
 float checkBattery();
 void SD_print_battery();
 bool startsWith(const char *pre, const char *str);
+void standBy(int sec);
 
 
 void setup()
 {
-
+  // initialize digital pin 13 as an output.
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
   
   //while (!Serial);  // uncomment to have the sketch wait until Serial is ready
   
@@ -84,10 +90,19 @@ void setup()
 
   // Setup the SD card
   SD_setup();
+
+  // start the RTC
+  rtc.begin();
+  rtc.setSeconds(0);
+  Serial.println("H:M:S");
+  Serial.println(rtc.getHours());
+  Serial.println(rtc.getMinutes());
+  Serial.println(rtc.getSeconds());
 }
 
 void loop() // run over and over again
 {
+  
   // read data from the GPS in the 'main loop'
   char c = GPS.read();
   // if you want to debug, this is a good time to do it!
@@ -95,7 +110,7 @@ void loop() // run over and over again
     if (c) Serial.print(c);
   // if a sentence is received, we can check the checksum, parse it...
   if (GPS.newNMEAreceived()) {
-  
+    Serial.println(millis());
     // a tricky thing here is if we print the NMEA sentence, or data
     // we end up not listening and catching other sentences!
     // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
@@ -120,7 +135,7 @@ void loop() // run over and over again
         write_trkpt_to_gpx();
         PRINT_GPX(gpx);
         SD_print_battery();
-        return;
+        // return;
       }
       
       if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
@@ -129,6 +144,9 @@ void loop() // run over and over again
       }
  
     }
+  }
+  else { // no NMEA received; sleep for 4 seconds
+    standBy(4);
   }
 }
 
@@ -167,9 +185,16 @@ void write_trkpt_to_gpx() {
   char lat[16];
   char lon[16];
   char ele[16];
+  static uint8_t prev_hour, prev_day = 0;
 
   print_GPS();
-  // sprintf(s, trkpt, GPS.latitude, GPS.longitude, GPS.altitude, GPS.year, GPS.month, GPS.day, GPS.hour, GPS.minute, GPS.seconds);
+
+  // there is a situation where the hour has ticked over but the date has not. fix it here.
+  if (GPS.hour < prev_hour && GPS.day == prev_day) {
+    GPS.day++;
+  }
+  prev_hour = GPS.hour;
+  prev_day = GPS.day;
   
   sprintf(s, trkpt, 
     convert_coord(GPS.latitude, GPS.lat, lat), 
@@ -213,7 +238,10 @@ void write_to_gpx(const char *s) {
     gpx.seek(gpx.position() - l);
     // Serial.print("Seeking, position: "); Serial.println(gpx.position());
     gpx.flush();
-
+    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(100);              // wait for a second
+    digitalWrite(13, LOW);
+    
   } else {
     Serial.print("GPX file not open: "); Serial.println(gpx);
   }  
@@ -468,5 +496,30 @@ bool startsWith(const char *pre, const char *str)
   result = (strncmp(pre, realStart, strlen(pre)) == 0);
   // Serial.print("Rslt: "); Serial.println(result?1:0);
   return result;
+}
+
+void standBy(int s) {
+  AlarmTime += s; // Adds 's' seconds to alarm time
+  AlarmTime = AlarmTime % 60; // checks for roll over 60 seconds and corrects
+  rtc.setAlarmSeconds(AlarmTime); // Wakes at next alarm time, i.e. every 's' secs
+  Serial.print("Setting alarm for (seconds): "); Serial.println(AlarmTime);
+  rtc.enableAlarm(rtc.MATCH_SS); // Match seconds only
+  Serial.print("Enabled.");
+  rtc.attachInterrupt(alarmMatch); // Attach function to interupt
+  Serial.print("Attached.");
+  delay(5);                     // brief delay; is it really needed?
+  // Need to detach the USB and reattach on wakeup
+  Serial.end();
+  USBDevice.detach();   // Safely detach the USB prior to sleeping
+  rtc.standbyMode();    // Sleep until next alarm match
+  USBDevice.attach();   // Re-attach the USB
+  Serial.print("Standby.");
+
+}
+
+void alarmMatch() // Do something (nothing!) when interrupt called
+{
+  Serial.println("Woke up");
+  return;
 }
 
