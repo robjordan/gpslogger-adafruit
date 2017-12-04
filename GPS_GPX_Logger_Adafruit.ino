@@ -12,6 +12,14 @@
 
 #define FALSE 0
 #define TRUE (!FALSE)
+#define PMTK_SET_Nav_Speed_0_0 "$PMTK386,0*23"
+#define PMTK_SET_Nav_Speed_0_2 "$PMTK386,0.2*3F"
+#define PMTK_SET_Nav_Speed_0_4 "$PMTK386,0.4*39"
+#define PMTK_SET_Nav_Speed_0_6 "$PMTK386,0.6*3B"
+#define PMTK_SET_Nav_Speed_0_8 "$PMTK386,0.8*35"
+#define PMTK_SET_Nav_Speed_1_0 "$PMTK386,1.0*3C"
+#define PMTK_SET_Nav_Speed_1_5 "$PMTK386,1.5*39"
+#define PMTK_SET_Nav_Speed_2_0 "$PMTK386,2.0*3F"
 
 // Set GPSECHO to 'false' to turn off echoing the GPS data to the Serial console
 // Set to 'true' if you want to debug and listen to the raw GPS sentences
@@ -33,6 +41,7 @@
 // GPS data structure is global, as is the file handle for our GPX file
 Adafruit_GPS GPS(&GPSSerial);
 File gpx;
+File debug;
 bool gpx_open = FALSE;
 uint32_t timer = millis();
 Sd2Card card;
@@ -52,6 +61,12 @@ char *dtostrf(double __val,signed char __width,unsigned char __prec,char * __s);
 char *convert_coord(double nmea, char compass, char *s);
 char *dtostrf(double val, int width, unsigned int prec, char *sout);
 void dateTime(uint16_t* date, uint16_t* time);
+void SD_println(const char *s);
+void GPS_setup();
+float checkBattery();
+void SD_print_battery();
+bool startsWith(const char *pre, const char *str);
+
 
 void setup()
 {
@@ -64,26 +79,8 @@ void setup()
   Serial.begin(115200);
   Serial.println("Log GPS coordinates to SD card as a GPX file.");
      
-  // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
-  GPS.begin(9600);
-  // uncomment this line to turn on RMC (recommended minimum) and GGA (fix data) including altitude
-  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-  // uncomment this line to turn on only the "minimum recommended" data
-  //GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
-  // For parsing data, we don't suggest using anything but either RMC only or RMC+GGA since
-  // the parser doesn't care about other sentences at this time
-  // Set the update rate
-  GPS.sendCommand( PMTK_SET_NMEA_UPDATE_200_MILLIHERTZ); // One reading every 5 seconds
-  // For the parsing code to work nicely and have time to sort thru the data, and
-  // print it out we don't suggest using anything higher than 1 Hz
-     
-  // Request updates on antenna status, comment out to keep quiet
-  // GPS.sendCommand(PGCMD_ANTENNA);
-
-  delay(1000);
-  
-  // Ask for firmware version
-  GPSSerial.println(PMTK_Q_RELEASE);
+  // Setup the GPS device
+  GPS_setup();
 
   // Setup the SD card
   SD_setup();
@@ -98,10 +95,13 @@ void loop() // run over and over again
     if (c) Serial.print(c);
   // if a sentence is received, we can check the checksum, parse it...
   if (GPS.newNMEAreceived()) {
+  
     // a tricky thing here is if we print the NMEA sentence, or data
     // we end up not listening and catching other sentences!
     // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
     Serial.println(GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
+    SD_println(GPS.lastNMEA());
+    
     if (!GPS.parse(GPS.lastNMEA())) // this also sets the newNMEAreceived() flag to false
       return; // we can fail to parse a sentence in which case we should just wait for another
     else {
@@ -116,10 +116,18 @@ void loop() // run over and over again
       }
 
       // Now log the new data to the gpx file
-      if (gpx_open && GPS.fix && strstr(GPS.lastNMEA(), "$GPGGA")) {
+      if (gpx_open && GPS.fix && startsWith("$GPGGA", GPS.lastNMEA())) {
         write_trkpt_to_gpx();
         PRINT_GPX(gpx);
+        SD_print_battery();
+        return;
       }
+      
+      if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
+        // We need to reinitialise the settings
+        GPS_setup();
+      }
+ 
     }
   }
 }
@@ -369,5 +377,96 @@ void dateTime(uint16_t* date, uint16_t* time) {
 
  // return time using FAT_TIME macro to format fields
  *time = FAT_TIME(GPS.hour, GPS.minute, GPS.seconds);
+}
+
+void SD_println(const char *s) {
+
+  char filename[13];
+
+  if (!debug) {
+    randomSeed(analogRead(14));
+    unsigned seqno = random(99999999);
+    sprintf(filename, "%08d.NM", seqno++);
+    debug = SD.open(filename, FILE_WRITE);
+  }
+
+  if (debug) {
+    unsigned l = strlen(s);
+    debug.write(s, l);
+    debug.write("\n", 1);
+    debug.flush();
+  } else {
+    Serial.print("Open debug file failed: ");
+  }
+}
+
+void GPS_setup() {
+    // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
+  GPS.begin(9600);
+  // uncomment this line to turn on RMC (recommended minimum) and GGA (fix data) including altitude
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  // uncomment this line to turn on only the "minimum recommended" data
+  //GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
+  // For parsing data, we don't suggest using anything but either RMC only or RMC+GGA since
+  // the parser doesn't care about other sentences at this time
+  // Set the update rate
+  GPS.sendCommand( PMTK_API_SET_FIX_CTL_200_MILLIHERTZ); // One fix every 5 seconds
+  GPS.sendCommand( PMTK_SET_NMEA_UPDATE_200_MILLIHERTZ); // One reading every 5 seconds
+  // For the parsing code to work nicely and have time to sort thru the data, and
+  // print it out we don't suggest using anything higher than 1 Hz
+  GPS.sendCommand(PMTK_SET_Nav_Speed_0_6);  // Suppress readings where movement is < 0.6 m/s
+     
+  // Request updates on antenna status, comment out to keep quiet
+  // GPS.sendCommand(PGCMD_ANTENNA);
+
+  delay(1000);
+  
+  // Ask for firmware version
+  GPSSerial.println(PMTK_Q_RELEASE);
+}
+
+float checkBattery(){
+  //This returns the current voltage of the battery on a Feather 32u4.
+  float measuredvbat = analogRead(9);
+  measuredvbat *= 2;    // we divided by 2, so multiply back
+  measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
+  measuredvbat /= 1024; // convert to voltage
+
+  
+  return measuredvbat;
+}
+
+void SD_print_battery() {
+  char* fmt="BATT:,\"%04d/%02d/%02d %02d:%02d:%02d\",%s\n"; 
+  char line[40];
+  char batt[8];
+
+  // Serial.println("pre-checkBattery");
+  dtostrf((double)checkBattery(), 5, 3, batt);
+  // Serial.println("post-checkBattery");
+  // Serial.println(batt);
+  sprintf(line, fmt, 
+    GPS.year+2000, 
+    GPS.month, 
+    GPS.day, 
+    GPS.hour, 
+    GPS.minute, 
+    GPS.seconds,     
+    batt);
+  SD_println(line);
+  Serial.println(line);
+}
+
+bool startsWith(const char *pre, const char *str)
+{
+  bool result;
+  const char *realStart = str;
+  while (isspace(*realStart))
+    realStart++;
+  // Serial.print("Pre: "); Serial.print("#");Serial.print(pre); Serial.println("#");
+  // Serial.print("Str: "); Serial.print("#");Serial.println(realStart);Serial.println("#");
+  result = (strncmp(pre, realStart, strlen(pre)) == 0);
+  // Serial.print("Rslt: "); Serial.println(result?1:0);
+  return result;
 }
 
