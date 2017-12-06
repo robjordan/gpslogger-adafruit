@@ -26,13 +26,6 @@
 // Set to 'true' if you want to debug and listen to the raw GPS sentences
 #define GPSECHO false
 
-// Dump the contents of the GPX file after each write, to save removing SD card
-#ifdef DEBUG_GPX
-#define PRINT_GPX(gpx) int savepos = gpx.position(); gpx.seek(0); while (gpx.available()) {Serial.write(gpx.read());}; gpx.seek(savepos);
-#else
-#define PRINT_GPX(gpx)
-#endif
-
 // what's the name of the hardware serial port?
 #define GPSSerial Serial1
 
@@ -50,7 +43,7 @@ SdVolume volume;
 SdFile root;
 const int chipSelect = 4;
 RTCZero rtc;
-int AlarmTime;
+int AlarmTime = 0;
 
 // Pre-declare functions other than those returning int
 File create_gpx();
@@ -70,6 +63,7 @@ float checkBattery();
 void SD_print_battery();
 bool startsWith(const char *pre, const char *str);
 void standBy(int sec);
+void alarmMatch();
 
 
 void setup()
@@ -91,13 +85,8 @@ void setup()
   // Setup the SD card
   SD_setup();
 
-  // start the RTC
+  // start a real-time clock
   rtc.begin();
-  rtc.setSeconds(0);
-  Serial.println("H:M:S");
-  Serial.println(rtc.getHours());
-  Serial.println(rtc.getMinutes());
-  Serial.println(rtc.getSeconds());
 }
 
 void loop() // run over and over again
@@ -127,13 +116,11 @@ void loop() // run over and over again
         SdFile::dateTimeCallback(dateTime);
         if (create_gpx ())
           gpx_open = TRUE;
-          PRINT_GPX(gpx);
       }
 
       // Now log the new data to the gpx file
       if (gpx_open && GPS.fix && startsWith("$GPGGA", GPS.lastNMEA())) {
         write_trkpt_to_gpx();
-        PRINT_GPX(gpx);
         SD_print_battery();
         // return;
       }
@@ -144,9 +131,6 @@ void loop() // run over and over again
       }
  
     }
-  }
-  else { // no NMEA received; sleep for 4 seconds
-    standBy(4);
   }
 }
 
@@ -239,8 +223,11 @@ void write_to_gpx(const char *s) {
     // Serial.print("Seeking, position: "); Serial.println(gpx.position());
     gpx.flush();
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-    delay(100);              // wait for a second
+    delay(50);                // wait briefly
     digitalWrite(13, LOW);
+
+    // now we've got a track point, sleep for 4 seconds
+    standBy(4);
     
   } else {
     Serial.print("GPX file not open: "); Serial.println(gpx);
@@ -498,28 +485,21 @@ bool startsWith(const char *pre, const char *str)
   return result;
 }
 
-void standBy(int s) {
-  AlarmTime += s; // Adds 's' seconds to alarm time
+void standBy(int sleepS) {
+  AlarmTime = rtc.getSeconds();
+  AlarmTime += sleepS; // Adds S seconds to alarm time
   AlarmTime = AlarmTime % 60; // checks for roll over 60 seconds and corrects
-  rtc.setAlarmSeconds(AlarmTime); // Wakes at next alarm time, i.e. every 's' secs
-  Serial.print("Setting alarm for (seconds): "); Serial.println(AlarmTime);
+  rtc.setAlarmSeconds(AlarmTime); // Wakes at next alarm time
+  
   rtc.enableAlarm(rtc.MATCH_SS); // Match seconds only
-  Serial.print("Enabled.");
   rtc.attachInterrupt(alarmMatch); // Attach function to interupt
-  Serial.print("Attached.");
-  delay(5);                     // brief delay; is it really needed?
-  // Need to detach the USB and reattach on wakeup
-  Serial.end();
-  USBDevice.detach();   // Safely detach the USB prior to sleeping
   rtc.standbyMode();    // Sleep until next alarm match
-  USBDevice.attach();   // Re-attach the USB
-  Serial.print("Standby.");
 
 }
 
-void alarmMatch() // Do something (nothing!) when interrupt called
+void alarmMatch() // Do something when interrupt called
 {
-  Serial.println("Woke up");
-  return;
+         
+    
 }
 
