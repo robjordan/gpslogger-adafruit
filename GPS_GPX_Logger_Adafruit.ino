@@ -6,13 +6,19 @@
      
 #include <Adafruit_GPS.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <RTCZero.h>
 
 #define FALSE 0
 #define TRUE (!FALSE)
+
+// Test with reduced SPI speed for breadboards.  SD_SCK_MHZ(4) will select 
+// the highest speed supported by the board that is not over 4 MHz.
+// Change SPI_SPEED to SD_SCK_MHZ(50) for best performance.
+#define SPI_SPEED SD_SCK_MHZ(4)
+
 #define PMTK_SET_Nav_Speed_0_0 "$PMTK386,0*23"
 #define PMTK_SET_Nav_Speed_0_2 "$PMTK386,0.2*3F"
 #define PMTK_SET_Nav_Speed_0_4 "$PMTK386,0.4*39"
@@ -38,9 +44,17 @@ File gpx;
 File debug;
 bool gpx_open = FALSE;
 uint32_t timer = millis();
-Sd2Card card;
-SdVolume volume;
-SdFile root;
+// File system object.
+SdFat sd;
+
+// Serial streams
+ArduinoOutStream cout(Serial);
+
+// input buffer for line
+char cinBuf[40];
+ArduinoInStream cin(Serial, cinBuf, sizeof(cinBuf));
+
+// SD card chip select
 const int chipSelect = 4;
 RTCZero rtc;
 int AlarmTime = 0;
@@ -64,7 +78,6 @@ void SD_print_battery();
 bool startsWith(const char *pre, const char *str);
 void standBy(int sec);
 void alarmMatch();
-
 
 void setup()
 {
@@ -139,7 +152,7 @@ File create_gpx() {
   // GPX file header
   const char gpxhead[] = "<?xml version=\'1.0\' encoding=\'UTF-8\' standalone=\'yes\' ?>\n<gpx version=\"1.1\"\n creator=\"RMJ-GPXLogger\"\n xmlns=\"http://www.topografix.com/GPX/1/1\"\n xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd\">\n<trk>\n<trkseg>\n";
 
-  gpx = SD.open(gpx_filename(), FILE_WRITE);
+  gpx = sd.open(gpx_filename(), FILE_WRITE);
   if (gpx) {
     write_to_gpx(gpxhead);
   } else {
@@ -208,19 +221,23 @@ char *convert_coord(double nmea, char compass, char *s) {
 void write_to_gpx(const char *s) {
   
   const char gpxtail[] = "</trkseg>\n</trk>\n</gpx>\n";
+  static uint32_t sizeLessTail = 0;
+  const unsigned long lenTail = strlen(gpxtail);
   
   if (gpx) {
-    unsigned int l = strlen(s);
-    gpx.write(s, l);
-    Serial.print("Wrote: "); Serial.println(l);
+    unsigned long lenS = strlen(s);
+    boolean truncRC;
+    
+    truncRC = gpx.truncate(sizeLessTail);
+    Serial.print("Truncated, size, rc: "); Serial.print(sizeLessTail); Serial.print(" "); Serial.println(truncRC);    
+    gpx.write(s, lenS);
+    Serial.print("Wrote: "); Serial.println(lenS);
     Serial.print(s);
-    // Serial.print("Position: "); Serial.println(gpx.position());
-    l = strlen(gpxtail);
-    gpx.write(gpxtail, l);
-    // Serial.print("Wrote: "); Serial.println(l);
-    // Serial.print("Position: "); Serial.println(gpx.position());
-    gpx.seek(gpx.position() - l);
-    // Serial.print("Seeking, position: "); Serial.println(gpx.position());
+    sizeLessTail = gpx.size();
+    
+    gpx.write(gpxtail, lenTail);
+    Serial.print("Wrote: "); Serial.println(lenTail);
+
     gpx.flush();
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
     delay(50);                // wait briefly
@@ -236,82 +253,77 @@ void write_to_gpx(const char *s) {
   
 }
 
+void cardOrSpeed() {
+  cout << F("Try another SD card or reduce the SPI bus speed.\n");
+  cout << F("Edit SPI_SPEED in this program to change it.\n");
+}
+
+void reformatMsg() {
+  cout << F("Try reformatting the card.  For best results use\n");
+  cout << F("the SdFormatter program in SdFat/examples or download\n");
+  cout << F("and use SDFormatter from www.sdcard.org/downloads.\n");
+}
+
 void SD_setup()
 {
   Serial.print("\nInitializing SD card...");
 
-  // we'll use the initialization code from the utility libraries
-  // since we're just testing if the card is working!
-  if (!card.init(SPI_HALF_SPEED, chipSelect)) {
-    Serial.println("initialization failed. Things to check:");
-    Serial.println("* is a card inserted?");
-    Serial.println("* is your wiring correct?");
-    Serial.println("* did you change the chipSelect pin to match your shield or module?");
-    return;
-  } else {
-    Serial.println("Wiring is correct and a card is present.");
-  }
-
-  // print the type of card
-  Serial.println();
-  Serial.print("Card type:         ");
-  switch (card.type()) {
-    case SD_CARD_TYPE_SD1:
-      Serial.println("SD1");
-      break;
-    case SD_CARD_TYPE_SD2:
-      Serial.println("SD2");
-      break;
-    case SD_CARD_TYPE_SDHC:
-      Serial.println("SDHC");
-      break;
-    default:
-      Serial.println("Unknown");
-  }
-
-  // Now we will try to open the 'volume'/'partition' - it should be FAT16 or FAT32
-  if (!volume.init(card)) {
-    Serial.println("Could not find FAT16/FAT32 partition.\nMake sure you've formatted the card");
+  if (!sd.begin(chipSelect, SPI_SPEED)) {
+    if (sd.card()->errorCode()) {
+      cout << F(
+             "\nSD initialization failed.\n"
+             "Do not reformat the card!\n"
+             "Is the card correctly inserted?\n"
+             "Is chipSelect set to the correct value?\n"
+             "Does another SPI device need to be disabled?\n"
+             "Is there a wiring/soldering problem?\n");
+      cout << F("\nerrorCode: ") << hex << showbase;
+      cout << int(sd.card()->errorCode());
+      cout << F(", errorData: ") << int(sd.card()->errorData());
+      cout << dec << noshowbase << endl;
+      return;
+    }
+    cout << F("\nCard successfully initialized.\n");
+    if (sd.vol()->fatType() == 0) {
+      cout << F("Can't find a valid FAT16/FAT32 partition.\n");
+      reformatMsg();
+      return;
+    }
+    if (!sd.vwd()->isOpen()) {
+      cout << F("Can't open root directory.\n");
+      reformatMsg();
+      return;
+    }
+    cout << F("Can't determine error type\n");
     return;
   }
+  cout << F("\nCard successfully initialized.\n");
+  cout << endl;
 
-  Serial.print("Clusters:          ");
-  Serial.println(volume.clusterCount());
-  Serial.print("Blocks x Cluster:  ");
-  Serial.println(volume.blocksPerCluster());
+  uint32_t size = sd.card()->cardSize();
+  if (size == 0) {
+    cout << F("Can't determine the card size.\n");
+    cardOrSpeed();
+    return;
+  }
+  uint32_t sizeMB = 0.000512 * size + 0.5;
+  cout << F("Card size: ") << sizeMB;
+  cout << F(" MB (MB = 1,000,000 bytes)\n");
+  cout << endl;
+  cout << F("Volume is FAT") << int(sd.vol()->fatType());
+  cout << F(", Cluster size (bytes): ") << 512L * sd.vol()->blocksPerCluster();
+  cout << endl << endl;
 
-  Serial.print("Total Blocks:      ");
-  Serial.println(volume.blocksPerCluster() * volume.clusterCount());
-  Serial.println();
+  cout << F("Files found (date time size name):\n");
+  sd.ls(LS_R | LS_DATE | LS_SIZE);
 
-  // print the type and size of the first FAT-type volume
-  uint32_t volumesize;
-  Serial.print("Volume type is:    FAT");
-  Serial.println(volume.fatType(), DEC);
-
-  volumesize = volume.blocksPerCluster();    // clusters are collections of blocks
-  volumesize *= volume.clusterCount();       // we'll have a lot of clusters
-  volumesize /= 2;                           // SD card blocks are always 512 bytes (2 blocks are 1KB)
-  Serial.print("Volume size (Kb):  ");
-  Serial.println(volumesize);
-  Serial.print("Volume size (Mb):  ");
-  volumesize /= 1024;
-  Serial.println(volumesize);
-  Serial.print("Volume size (Gb):  ");
-  Serial.println((float)volumesize / 1024.0);
-
-  Serial.println("\nFiles found on the card (name, date and size in bytes): ");
-  root.openRoot(volume);
-
-  // list all files in the card with date and size
-  root.ls(LS_R | LS_DATE | LS_SIZE);
-
-  // see if the card is present and can be initialized:
-  if (!SD.begin(chipSelect)) {
-    Serial.println("Card failed, or not present");
-    // don't do anything more:
-  } else {
-    Serial.println("card initialized.");
+  if ((sizeMB > 1100 && sd.vol()->blocksPerCluster() < 64)
+      || (sizeMB < 2200 && sd.vol()->fatType() == 32)) {
+    cout << F("\nThis card should be reformatted for best performance.\n");
+    cout << F("Use a cluster size of 32 KB for cards larger than 1 GB.\n");
+    cout << F("Only cards larger than 2 GB should be formatted FAT32.\n");
+    reformatMsg();
+    return;
   }
 }
 
@@ -402,7 +414,7 @@ void SD_println(const char *s) {
     randomSeed(analogRead(14));
     unsigned seqno = random(99999999);
     sprintf(filename, "%08d.NM", seqno++);
-    debug = SD.open(filename, FILE_WRITE);
+    debug = sd.open(filename, FILE_WRITE);
   }
 
   if (debug) {
