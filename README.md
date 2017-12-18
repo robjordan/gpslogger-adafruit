@@ -10,7 +10,7 @@ shrunk from 24 bytes to 15 bytes."
 
 Adafruit Ultimate GPS (same MKT3339 module) says (https://www.adafruit.com/product/746) "The time, date, 
 longitude, latitude, and height is logged every 15 seconds and only when there is a fix. The internal FLASH 
-can store about 16 hours of data." This implies there is capacity for 16*60*60/15 = 3840 location log entries.
+can store about 16 hours of data." This implies there is capacity for 16 * 60 * 60 / 15 = 3840 location log entries.
 
 Analysis of the raw and parsed output using the Adafruit online parser 
 (https://learn.adafruit.com/custom/ultimate-gps-parser) shows that:
