@@ -1,7 +1,8 @@
 // Log GPS coordinates to SD card as a GPX file.
 //
 // Based on: Test code for Ultimate GPS Using Hardware Serial (e.g. GPS Flora or FeatherWing)
-//
+// This version sets up LOCUS logging (autonomous logging to flash by the GPS Featherwing). 
+// Then reads the flash at reset, and writes it to a GPX file on SD card, before restarting.
 
      
 #include <Adafruit_GPS.h>
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <RTCZero.h>
+#include <ArduinoLog.h>
 
 #define FALSE 0
 #define TRUE (!FALSE)
@@ -27,6 +29,13 @@
 #define PMTK_SET_Nav_Speed_1_0 "$PMTK386,1.0*3C"
 #define PMTK_SET_Nav_Speed_1_5 "$PMTK386,1.5*39"
 #define PMTK_SET_Nav_Speed_2_0 "$PMTK386,2.0*3F"
+#define PMTK_LOCUS_QUERY_STATUS "$PMTK183*38"
+#define PMTK_LOCUS_ERASE_FLASH "$PMTK184,1*22"
+#define PMTK_LOCUS_STOP_LOGGER "$PMTK185,1*23"
+#define PMTK_LOCUS_INTERVAL_5s "$PMTK,187,1,5*38"
+#define PMTK_LOCUS_LOG_NOW "$PMTK186,1*20"
+#define PMTK_Q_LOCUS_DATA_USED "$PMTK622,1*29"
+#define PMTK_Q_LOCUS_DATA_FULL "$PMTK622,0*28"
 
 // Set GPSECHO to 'false' to turn off echoing the GPS data to the Serial console
 // Set to 'true' if you want to debug and listen to the raw GPS sentences
@@ -44,18 +53,17 @@ File gpx;
 File debug;
 bool gpx_open = FALSE;
 uint32_t timer = millis();
-// File system object.
-SdFat sd;
+char buf[256];    // generic buffer for formatting printed output
 
-// Serial streams
+// File system objects
+SdFat sd; // file system
+SdFile sdLogger; // logging file
+
+
+// Serial stream for debug output in C++ style
 ArduinoOutStream cout(Serial);
 
-// input buffer for line
-char cinBuf[40];
-ArduinoInStream cin(Serial, cinBuf, sizeof(cinBuf));
-
-// SD card chip select
-const int chipSelect = 4;
+// Real-time clock
 RTCZero rtc;
 int AlarmTime = 0;
 
@@ -64,39 +72,47 @@ File create_gpx();
 void SD_setup();
 void write_trkpt_to_gpx();
 char *gpx_filename();
-void write_trkpt_to_gpx();
 void write_to_gpx(const char *s);
 void print_GPS();
-char *dtostrf(double __val,signed char __width,unsigned char __prec,char * __s);
 char *convert_coord(double nmea, char compass, char *s);
 char *dtostrf(double val, int width, unsigned int prec, char *sout);
 void dateTime(uint16_t* date, uint16_t* time);
-void SD_println(const char *s);
 void GPS_setup();
-float checkBattery();
-void SD_print_battery();
+double checkBattery();
 bool startsWith(const char *pre, const char *str);
 void standBy(int sec);
 void alarmMatch();
 
 void setup()
 {
-  // initialize digital pin 13 as an output.
+  // initialize digital pin 13 (green LED) to flash on SD card writes
   pinMode(13, OUTPUT);
   digitalWrite(13, LOW);
   
   //while (!Serial);  // uncomment to have the sketch wait until Serial is ready
   
-  // connect at 115200 so we can read the GPS fast enough and echo without dropping chars
-  // also spit it out
+  // Setup the SD card
+  SD_setup();
+
+  // Create a logger (might be Serial or SD file
+  Log.begin(LOG_LEVEL_VERBOSE, &sdLogger);
+  // Log.begin(LOG_LEVEL_VERBOSE, &Serial);
+
+
+  // connect over USB at 115200 so we can read the GPS fast enough and echo without dropping chars
   Serial.begin(115200);
-  Serial.println("Log GPS coordinates to SD card as a GPX file.");
+  Log.notice("Check GPS module flash for log points & write to SD card as a GPX file." CR);
      
   // Setup the GPS device
   GPS_setup();
-
-  // Setup the SD card
-  SD_setup();
+  if (!GPS.LOCUS_StopLogger()) {
+    Log.error("GPS.LOCUS_StopLogger error" CR);
+  }
+  
+  // if there are log entries in LOCUS flash, write them to SD card
+  if (GPS_LOCUS_records()) {
+    
+  } 
 
   // start a real-time clock
   rtc.begin();
@@ -112,12 +128,11 @@ void loop() // run over and over again
     if (c) Serial.print(c);
   // if a sentence is received, we can check the checksum, parse it...
   if (GPS.newNMEAreceived()) {
-    Serial.println(millis());
+    Log.trace("Milliseconds: %d" CR, millis());
     // a tricky thing here is if we print the NMEA sentence, or data
     // we end up not listening and catching other sentences!
     // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
-    Serial.println(GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
-    SD_println(GPS.lastNMEA());
+    Log.notice("%s" CR, GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
     
     if (!GPS.parse(GPS.lastNMEA())) // this also sets the newNMEAreceived() flag to false
       return; // we can fail to parse a sentence in which case we should just wait for another
@@ -126,16 +141,23 @@ void loop() // run over and over again
       
       // We have received and parsed a sentence. Does it have date? If we haven't created a dated GPX file, create it now
       if (!gpx_open && GPS.fix && GPS.year) {
-        SdFile::dateTimeCallback(dateTime);
-        if (create_gpx ())
+         if (create_gpx ())
           gpx_open = TRUE;
+      	else
+      	  Log.error("Failed to create GPX file" CR);
       }
 
       // Now log the new data to the gpx file
       if (gpx_open && GPS.fix && startsWith("$GPGGA", GPS.lastNMEA())) {
         write_trkpt_to_gpx();
-        SD_print_battery();
-        // return;
+      	Log.notice("BATT:,\"%d/%d/%d %d:%d:%d\",%s" CR, 
+      		   GPS.year, 
+      		   GPS.month, 
+      		   GPS.day, 
+      		   GPS.hour, 
+      		   GPS.minute, 
+      		   GPS.seconds, 
+      		   dtostrf(checkBattery(), 5, 3, buf));
       }
       
       if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
@@ -156,7 +178,7 @@ File create_gpx() {
   if (gpx) {
     write_to_gpx(gpxhead);
   } else {
-    Serial.print("Open file failed: "); Serial.println(gpx);
+    Log.error("Open file failed: %s" CR, gpx_filename());
   }
   return (gpx); 
 }
@@ -172,7 +194,7 @@ char *gpx_filename() {
     GPS.day, 
     alphabet[(GPS.hour*60+GPS.minute)/sizeof(alphabet)], 
     alphabet[(GPS.hour*60+GPS.minute)%sizeof(alphabet)]);
-  Serial.print("GPX filename: "); Serial.println(filename);
+  Log.trace("GPX filename: %s" CR, filename);
   return(filename);
 }
 
@@ -229,16 +251,15 @@ void write_to_gpx(const char *s) {
     boolean truncRC;
     
     truncRC = gpx.truncate(sizeLessTail);
-    Serial.print("Truncated, size, rc: "); Serial.print(sizeLessTail); Serial.print(" "); Serial.println(truncRC);    
+    Log.trace("Truncated, size: %d, rc: %d" CR, sizeLessTail, truncRC);    
     gpx.write(s, lenS);
-    Serial.print("Wrote: "); Serial.println(lenS);
-    Serial.print(s);
+    Log.trace("Wrote: %d" CR, lenS);
+    Log.trace(s);
     sizeLessTail = gpx.size();
     
     gpx.write(gpxtail, lenTail);
-    Serial.print("Wrote: "); Serial.println(lenTail);
+    Log.trace("Wrote: %d" CR, lenTail);
 
-    gpx.flush();
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
     delay(50);                // wait briefly
     digitalWrite(13, LOW);
@@ -247,11 +268,12 @@ void write_to_gpx(const char *s) {
     standBy(4);
     
   } else {
-    Serial.print("GPX file not open: "); Serial.println(gpx);
+    Log.error("GPX file not open." CR);
   }  
   return;
   
 }
+
 
 void cardOrSpeed() {
   cout << F("Try another SD card or reduce the SPI bus speed.\n");
@@ -266,7 +288,10 @@ void reformatMsg() {
 
 void SD_setup()
 {
-  Serial.print("\nInitializing SD card...");
+  // SD card chip select
+  const int chipSelect = 4;
+
+  Log.notice(CR "Initializing SD card..." CR);
 
   if (!sd.begin(chipSelect, SPI_SPEED)) {
     if (sd.card()->errorCode()) {
@@ -325,29 +350,30 @@ void SD_setup()
     reformatMsg();
     return;
   }
+
+  // Setup callback to dateTime so that file creation dates are correct
+  SdFile::dateTimeCallback(dateTime);
+
+  // Open a log file
+  if (!sdLogger.open("GPSLoggr.log", O_WRITE | O_APPEND | O_CREAT)) {
+    cout << F("Unable to open sdLogger file.\n");
+  }
+  
 }
 
 void print_GPS() {
-  Serial.print("\nTime: ");
-  Serial.print(GPS.hour, DEC); Serial.print(':');
-  Serial.print(GPS.minute, DEC); Serial.print(':');
-  Serial.print(GPS.seconds, DEC); Serial.print('.');
-  Serial.println(GPS.milliseconds);
-  Serial.print("Date: ");
-  Serial.print(GPS.day, DEC); Serial.print('/');
-  Serial.print(GPS.month, DEC); Serial.print("/20");
-  Serial.println(GPS.year, DEC);
-  Serial.print("Fix: "); Serial.print((int)GPS.fix);
-  Serial.print(" quality: "); Serial.println((int)GPS.fixquality);
+  char lat[16];
+  char lon[16];
+
+  Log.trace("Date: %d/%d/%d" CR, GPS.day, GPS.month, GPS.year);
+  Log.trace("Time: %d:%d:%d" CR, GPS.hour, GPS.minute, GPS.seconds);
+  Log.trace("Fix: %d, quality %d" CR, (int)GPS.fix, (int)GPS.fixquality);
   if (GPS.fix) {
-    Serial.print("Location: ");
-    Serial.print(GPS.latitude, 4); Serial.print(GPS.lat);
-    Serial.print(", ");
-    Serial.print(GPS.longitude, 4); Serial.println(GPS.lon);
-    Serial.print("Speed (knots): "); Serial.println(GPS.speed);
-    Serial.print("Angle: "); Serial.println(GPS.angle);
-    Serial.print("Altitude: "); Serial.println(GPS.altitude);
-    Serial.print("Satellites: "); Serial.println((int)GPS.satellites);
+    Log.trace("Location: %s, %s" CR, convert_coord(GPS.latitude, GPS.lat, lat),  convert_coord(GPS.longitude, GPS.lon, lon));
+    Log.trace("Speed (knots): %s" CR, dtostrf((double)GPS.speed, 6, 2, buf)); 
+    Log.trace("Angle: %s" CR, dtostrf((double)GPS.angle, 6, 2, buf));
+    Log.trace("Altitude: %s" CR, dtostrf((double)GPS.altitude, 7, 1, buf));
+    Log.trace("Satellites: %d " CR, (int)GPS.satellites);
   }
 }
 
@@ -406,27 +432,6 @@ void dateTime(uint16_t* date, uint16_t* time) {
  *time = FAT_TIME(GPS.hour, GPS.minute, GPS.seconds);
 }
 
-void SD_println(const char *s) {
-
-  char filename[13];
-
-  if (!debug) {
-    randomSeed(analogRead(14));
-    unsigned seqno = random(99999999);
-    sprintf(filename, "%08d.NM", seqno++);
-    debug = sd.open(filename, FILE_WRITE);
-  }
-
-  if (debug) {
-    unsigned l = strlen(s);
-    debug.write(s, l);
-    debug.write("\n", 1);
-    debug.flush();
-  } else {
-    Serial.print("Open debug file failed: ");
-  }
-}
-
 void GPS_setup() {
     // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
   GPS.begin(9600);
@@ -452,52 +457,29 @@ void GPS_setup() {
   GPSSerial.println(PMTK_Q_RELEASE);
 }
 
-float checkBattery(){
+double checkBattery(){
   //This returns the current voltage of the battery on a Feather 32u4.
   float measuredvbat = analogRead(9);
   measuredvbat *= 2;    // we divided by 2, so multiply back
   measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
   measuredvbat /= 1024; // convert to voltage
-
   
-  return measuredvbat;
-}
-
-void SD_print_battery() {
-  char* fmt="BATT:,\"%04d/%02d/%02d %02d:%02d:%02d\",%s\n"; 
-  char line[40];
-  char batt[8];
-
-  // Serial.println("pre-checkBattery");
-  dtostrf((double)checkBattery(), 5, 3, batt);
-  // Serial.println("post-checkBattery");
-  // Serial.println(batt);
-  sprintf(line, fmt, 
-    GPS.year+2000, 
-    GPS.month, 
-    GPS.day, 
-    GPS.hour, 
-    GPS.minute, 
-    GPS.seconds,     
-    batt);
-  SD_println(line);
-  Serial.println(line);
+  return (double)measuredvbat;
 }
 
 bool startsWith(const char *pre, const char *str)
 {
-  bool result;
   const char *realStart = str;
   while (isspace(*realStart))
     realStart++;
-  // Serial.print("Pre: "); Serial.print("#");Serial.print(pre); Serial.println("#");
-  // Serial.print("Str: "); Serial.print("#");Serial.println(realStart);Serial.println("#");
-  result = (strncmp(pre, realStart, strlen(pre)) == 0);
-  // Serial.print("Rslt: "); Serial.println(result?1:0);
-  return result;
+  return (strncmp(pre, realStart, strlen(pre)) == 0);
 }
 
 void standBy(int sleepS) {
+  // make sure files are flushed before going to sleep
+  gpx.flush();
+  sdLogger.flush();
+  
   AlarmTime = rtc.getSeconds();
   AlarmTime += sleepS; // Adds S seconds to alarm time
   AlarmTime = AlarmTime % 60; // checks for roll over 60 seconds and corrects
@@ -513,5 +495,12 @@ void alarmMatch() // Do something when interrupt called
 {
          
     
+}
+
+int GPS_LOCUS_records() {
+  if (!GPS.LOCUS_ReadStatus()) {
+    Log.error("GPS.LOCUS_ReadStatus error" CR);
+  }
+  return GPS.LOCUS_records;
 }
 
