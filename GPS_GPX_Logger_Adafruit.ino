@@ -6,6 +6,8 @@
 
      
 #include <Adafruit_GPS.h>
+#include <Adafruit_ASFcore.h>
+#include <reset.h>
 #include <SPI.h>
 #include <SdFat.h>
 #include <stdlib.h>
@@ -21,7 +23,7 @@
 // Change SPI_SPEED to SD_SCK_MHZ(50) for best performance.
 #define SPI_SPEED SD_SCK_MHZ(4)
 
-#define LOCUS_BATCH_TIME 1200 // seconds
+#define LOCUS_BATCH_TIME 800 // seconds
 
 #define PMTK_SET_Nav_Speed_0_0 "$PMTK386,0*23"
 #define PMTK_SET_Nav_Speed_0_2 "$PMTK386,0.2*3F"
@@ -103,25 +105,31 @@ void setup()
   digitalWrite(13, LOW);
   
   // while (!Serial);   // uncomment to have the sketch wait until Serial is ready
-  delay(3000);          // Time for USB connection, GPS to finish reboot, etc.
+  delay(1000);          // Time for USB connection, GPS to finish reboot, etc.
   
   // Setup the SD card
   SD_setup();
-
-  // Create a logger (might be Serial or SD file
-  Log.begin(LOG_LEVEL_VERBOSE, &sdLogger);
-  // Log.begin(LOG_LEVEL_VERBOSE, &Serial);
-
-
   // connect over USB at 115200 so we can read the GPS fast enough and echo without dropping chars
   Serial.begin(115200);
-  Log.notice("setup(): Check GPS module flash for log points & write to SD card as a GPX file." CR);
-     
-  // start a real-time clock
-  rtc.begin();
 
-  // Setup the GPS device
-  GPS_setup();
+  // Create a logger (might be Serial or SD file)
+  Log.begin(LOG_LEVEL_VERBOSE, &sdLogger);
+  // Log.begin(LOG_LEVEL_VERBOSE, &Serial);
+  
+  Log.notice("setup(): Check GPS module flash for log points & write to SD card as a GPX file." CR);
+  Log.trace("setup(): system_reset_cause: %d" CR, system_get_reset_cause());
+  Log.trace("setup(): Date of wakeup: %d:%d:%d" CR, rtc.getDay(), rtc.getMonth(), rtc.getYear());
+  Log.trace("setup(): Time of wakeup: %d:%d:%d" CR, rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+
+  // Establish basic comms with GPS device and handshake to avoid any old, lingering LOCUS data
+  GPS_setup(); 
+
+  // If it's a user reset, the RTC will have been preserved - no need to get date/time from GPS
+  // If it's a power-on reset, the RTC will be all zeroes and we need to wait for a fix with date/time
+  if (rtc.getYear() == 0) {
+    rtc.begin();
+    GPS_setRTC();
+  }
 
   // If there was a logging activity going on before the reset, now's the time to convert it to GPX.
   // First retrieve any outstanding LOCUS data from the GPS module and store it on SD. Then rename 
@@ -134,8 +142,8 @@ void setup()
   process_locus_data();
 
   convert_to_gpx();
-  // rename old file just as precaution
 
+  // rename old LOCUS file just as precaution
   FatFile *fv = sd.vwd();
   char *newfilename = filename("LOC");
   Log.trace("sd.vwd(): %x, filename: %s" CR, fv, newfilename);
@@ -150,6 +158,11 @@ void setup()
   if (!locusFile.open("CURRENT.LOC", O_WRITE | O_CREAT)) {
     Log.error("Unable to open LOCUS file CURRENT.LOC" CR);
   }
+
+  // Instruct the GPS to start capturing LOCUS data (it may be running already if it was a soft reset
+  GPS_startLOCUS();
+
+  Log.trace("setup() exiting" CR);
   
   
 }
@@ -158,9 +171,12 @@ void loop() {
 
   Log.trace("loop(): About to sleep, milliseconds: %d" CR, millis());
 
+  // make sure files are flushed before going to sleep
+  gpx.flush();
+  locusFile.flush();
+
   // now we've handled a batch, sleep until it's next time to unload the LOCUS data
   standBy(LOCUS_BATCH_TIME);
-  // delay(LOCUS_BATCH_TIME*1000);
 
   Log.trace("loop(): Wakeup, milliseconds: %d" CR, millis());
 
@@ -169,10 +185,8 @@ void loop() {
   // Loop occurs every wakeup... make sure that we have all in-progress locus data transferred to SD file
   process_locus_data();
 
-  // make sure files are flushed before going to sleep
-  gpx.flush();
-  sdLogger.flush();
-  locusFile.flush();
+  Log.trace("loop() exiting" CR);
+
 
 
     
@@ -342,17 +356,17 @@ int append_locus_data_to_file () {
 
 char *filename(const char *suffix) {
   static char filename[19];  // 15+3 filename and a null terminator
-  char _suffix[3];
+  char _suffix[4];
 
   // truncate suffix at 3 characters just in case we are passed a long one.
   strncpy(_suffix, suffix, sizeof _suffix);
   sprintf(filename, "%04d%02d%02d-%02d%02d%02d.%s", 
-    GPS.year+2000, 
-    GPS.month, 
-    GPS.day, 
-    GPS.hour,
-    GPS.minute,
-    GPS.seconds, 
+    rtc.getYear()+2000, 
+    rtc.getMonth(), 
+    rtc.getDay(), 
+    rtc.getHours(),
+    rtc.getMinutes(),
+    rtc.getSeconds(), 
     _suffix
     );
   Log.trace("Filename: %s" CR, filename);
@@ -516,7 +530,7 @@ void SD_setup()
   SdFile::dateTimeCallback(dateTime);
 
   // Open a log file
-  if (!sdLogger.open(filename(".log"), O_WRITE | O_APPEND | O_CREAT)) {
+  if (!sdLogger.open("GPSlogger.log", O_WRITE | O_APPEND | O_CREAT)) {
     cout << F("Unable to open sdLogger file.\n");
   } 
 }
@@ -586,18 +600,24 @@ char *dtostrf(double val, int width, unsigned int prec, char *sout) {
 void dateTime(uint16_t* date, uint16_t* time) {
 
  // return date using FAT_DATE macro to format fields
- *date = FAT_DATE(GPS.year+2000, GPS.month, GPS.day);
+ *date = FAT_DATE(rtc.getYear()+2000, rtc.getMonth(), rtc.getDay());
 
  // return time using FAT_TIME macro to format fields
- *time = FAT_TIME(GPS.hour, GPS.minute, GPS.seconds);
+ *time = FAT_TIME(rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
 }
 
 
 void GPS_setup() {
   // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
   GPS.begin(9600);
+  // Ask for firmware version as handshake
+  GPS.sendCommand(PMTK_Q_RELEASE);
+  GPS.waitForSentence("$PMTK705");
+  // Now set baud rate to 115200 to speed up receipt of LOCUS data
+  
+}
 
-
+void GPS_setRTC() {
   // uncomment this line to turn on only the "minimum recommended" data
   GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
   // For parsing data, we don't suggest using anything but either RMC only or RMC+GGA since
@@ -609,18 +629,21 @@ void GPS_setup() {
   GPS.waitForSentence("$PMTK001,220");
   GPS.sendCommand(PMTK_SET_Nav_Speed_0_6);  // Suppress readings where movement is < 0.6 m/s
   GPS.waitForSentence("$PMTK001,386");
-  // Ask for firmware version
-  GPS.sendCommand(PMTK_Q_RELEASE);
-  GPS.waitForSentence("$PMTK705");
+
   
-  // Wait for a GPS fix and set date/time of RTC
-  while (!GPS.fix) {
+  // $GPRMC appears to emit a plausible date/time even in absence of a proper fix
+  // using battery-backed RTC no doubt. So no need to wait for fix. Just check for sane values.
+  do {
     GPS.waitForSentence("$GPRMC");
     GPS.parse(GPS.lastNMEA());
-  }
-  rtc.setDate(GPS.day, GPS.month, GPS.year+2000);
+    Log.trace("Date from $GPRMC: %d/%d/%d" CR, GPS.day, GPS.month, GPS.year);
+  } while (GPS.year < 11 || GPS.year > 79); // see https://forums.adafruit.com/viewtopic.php?f=19&t=28088
+  rtc.setDate(GPS.day, GPS.month, GPS.year);
+  Log.trace("Date from RTS: %d/%d/%d" CR, rtc.getDay(), rtc.getMonth(), rtc.getYear());
   rtc.setTime(GPS.hour, GPS.minute, GPS.seconds);
+}
 
+void GPS_startLOCUS() {
   // Now switch to LOCUS mode, turning off normal NMEA traffic
   GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_OFF);
   GPS.waitForSentence("$PMTK001,314");  
@@ -631,8 +654,6 @@ void GPS_setup() {
   // GPS.sendCommand(PGCMD_ANTENNA);
 
   delay(1000);
-  
-
 }
 
 
@@ -669,10 +690,13 @@ void standBy(int sleepS) {
   Log.trace("Current time: %d:%d:%d, sleep time %d seconds" CR, AlarmH, AlarmM, AlarmS, sleepS);
   AlarmS += sleepS;       // Adds S seconds to alarm time
   AlarmM += AlarmS / 60;  // Carry any excess over into the minutes
-  AlarmS = AlarmS % 60;   // and get the seconds back into range 0-59
+  AlarmS %= 60;           // and get the seconds back into range 0-59
+  
   AlarmH += AlarmM / 60;  // Carry excess minutes into hours
-  AlarmH = AlarmH % 24;   // and get hours into range 0-23
+  AlarmM %= 60;           // and get th eminutes back into range 0-59
+  AlarmH %= 24;           // and get hours into range 0-23
   Log.trace("Alarm time: %d:%d:%d" CR, AlarmH, AlarmM, AlarmS);
+  sdLogger.flush();
   rtc.setAlarmSeconds(AlarmS); // Wakes at next alarm time
   rtc.setAlarmMinutes(AlarmM);
   rtc.setAlarmHours(AlarmH);
