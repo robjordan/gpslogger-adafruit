@@ -14,6 +14,8 @@
 #include <string.h>
 #include <RTCZero.h>
 #include <ArduinoLog.h>
+#include <Time.h>
+// #include <Math.h>
 
 #define FALSE 0
 #define TRUE (!FALSE)
@@ -23,7 +25,8 @@
 // Change SPI_SPEED to SD_SCK_MHZ(50) for best performance.
 #define SPI_SPEED SD_SCK_MHZ(4)
 
-#define LOCUS_BATCH_TIME 800 // seconds
+#define LOCUS_BATCH_TIME 1200 // seconds
+#define MAXLINELENGTH 256
 
 #define PMTK_SET_Nav_Speed_0_0 "$PMTK386,0*23"
 #define PMTK_SET_Nav_Speed_0_2 "$PMTK386,0.2*3F"
@@ -41,6 +44,11 @@
 #define PMTK_Q_LOCUS_DATA_USED "$PMTK622,1*29"
 #define PMTK_Q_LOCUS_DATA_FULL "$PMTK622,0*28"
 #define PMTK_CMD_HOT_START "$PMTK101*32"
+#define PMTK_SET_NMEA_BAUDRATE_14400 "$PMTK251,14400*29"
+#define PMTK_SET_NMEA_BAUDRATE_19200 "$PMTK251,19200*22"
+#define PMTK_SET_NMEA_BAUDRATE_38400 "$PMTK251,38400*27"
+#define PMTK_SET_NMEA_BAUDRATE_57600 "$PMTK251,57600*2C"
+#define PMTK_SET_NMEA_BAUDRATE_115200 "$PMTK251,115200*1F"
 
 // what's the name of the hardware serial port?
 #define GPSSerial Serial1
@@ -48,8 +56,6 @@
 
 // GLOBALS
 Adafruit_GPS GPS(&GPSSerial);
-File gpx;		// handle for output in GPX format
-bool gpx_open = FALSE;
 uint32_t timer = millis();
 char buf[256];		// generic buffer for formatting printed output
 
@@ -57,6 +63,8 @@ char buf[256];		// generic buffer for formatting printed output
 SdFat sd;		// file system
 SdFile sdLogger; 	// logging file
 SdFile locusFile;	// temporary file to store locus track output in NMEA format
+SdFile gpx;       // to write GPX
+const char *locusFilename = "CURRENT.LOC";
 
 // Serial stream for debug output in C++ style
 ArduinoOutStream cout(Serial);
@@ -67,12 +75,19 @@ RTCZero rtc;
 // Persistent sequence number, for storing files with unique and sequential names
 const uint32_t seqno = 0;
 
+typedef struct point {
+  double latitude;
+  double longitude;
+  int16_t height;
+  time_t timestamp;
+  uint8_t fix;
+};
+
 // Pre-declare functions other than those returning int
-File create_gpx();
+boolean create_gpx();
 void SD_setup();
-void write_trkpt_to_gpx();
+int write_trkpt_to_gpx(point *p);
 char *filename(const char *suffix);
-void write_to_gpx(const char *s);
 void print_GPS();
 char *convert_coord(double nmea, char compass, char *s);
 char *dtostrf(double val, int width, unsigned int prec, char *sout);
@@ -100,12 +115,12 @@ void alarmMatch();
 void setup()
 {
 
-  // initialize digital pin 13 (green LED) to flash on SD card writes
+  // initialize digital pin 13 (red LED) to flash 
   pinMode(13, OUTPUT);
-  digitalWrite(13, LOW);
+  digitalWrite(13, HIGH);  // keep it illuminated until we have secured data to SD file
   
   // while (!Serial);   // uncomment to have the sketch wait until Serial is ready
-  delay(1000);          // Time for USB connection, GPS to finish reboot, etc.
+  // delay(5000);          // Time for USB connection, GPS to finish reboot, etc.
   
   // Setup the SD card
   SD_setup();
@@ -118,44 +133,57 @@ void setup()
   
   Log.notice("setup(): Check GPS module flash for log points & write to SD card as a GPX file." CR);
   Log.trace("setup(): system_reset_cause: %d" CR, system_get_reset_cause());
-  Log.trace("setup(): Date of wakeup: %d:%d:%d" CR, rtc.getDay(), rtc.getMonth(), rtc.getYear());
-  Log.trace("setup(): Time of wakeup: %d:%d:%d" CR, rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+
 
   // Establish basic comms with GPS device and handshake to avoid any old, lingering LOCUS data
   GPS_setup(); 
 
-  // If it's a user reset, the RTC will have been preserved - no need to get date/time from GPS
-  // If it's a power-on reset, the RTC will be all zeroes and we need to wait for a fix with date/time
-  if (rtc.getYear() == 0) {
-    rtc.begin();
-    GPS_setRTC();
-  }
+  // Get date/time from GPS. It should be valid, even without a fix, provided on-board battery is good
+  rtc.begin();
+  GPS_setRTC();
+  Log.trace("setup(): Date of wakeup: %d:%d:%d" CR, rtc.getDay(), rtc.getMonth(), rtc.getYear());
+  Log.trace("setup(): Time of wakeup: %d:%d:%d" CR, rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
 
   // If there was a logging activity going on before the reset, now's the time to convert it to GPX.
   // First retrieve any outstanding LOCUS data from the GPS module and store it on SD. Then rename 
   // the LOCUS file
   
   // Open the LOCUS data-in-progress (or create if there isn't one)
-  if (!locusFile.open("CURRENT.LOC", O_WRITE | O_APPEND | O_CREAT)) {
-    Log.error("Unable to open LOCUS file CURRENT.LOC" CR);
+  if (!locusFile.open(locusFilename, O_WRITE | O_APPEND | O_CREAT)) {
+    Log.error("Unable to open LOCUS file CURRENT.LOC for writing" CR);
   }
-  process_locus_data();
+  Log.trace("Opened %s, size %d\n" CR, locusFilename, locusFile.fileSize());
 
+  // pull any new records off flash and into the current LOCUS file on SD
+  process_locus_data();
+  locusFile.flush();
+
+  // convert the current LOCUS file on SD to GPX
   convert_to_gpx();
 
-  // rename old LOCUS file just as precaution
-  FatFile *fv = sd.vwd();
-  char *newfilename = filename("LOC");
-  Log.trace("sd.vwd(): %x, filename: %s" CR, fv, newfilename);
-  if (!locusFile.rename(fv, newfilename)) {
-    Log.error("Unable to rename LOCUS file CURRENT.LOC" CR);
-  }  
+  // rename old LOCUS file just as precaution in case data needs to be recovered
+  Log.trace("about to close %s, size %d\n" CR, locusFilename, locusFile.fileSize());
   if (!locusFile.close()) {
     Log.error("Unable to close LOCUS file CURRENT.LOC" CR);
   }
+  Log.trace("Closed %s, size %d\n" CR, locusFilename, locusFile.fileSize());
+  FatFile *fv = sd.vwd();
+  char *newfilename = filename("LOC");
+  Log.trace("Renaming %s as %s" CR, locusFilename, newfilename);
+  if (sd.exists(newfilename)) {
+    Log.error("File renaming to exists, wait one second and generate a new name." CR);
+    delay(1000);
+    newfilename = filename("LOC");
+  }
+  if (!sd.rename(locusFilename, newfilename)) {
+    Log.error("Unable to rename LOCUS file CURRENT.LOC" CR);
+  }  
+  
+  // All the data is now safe, give a reassuring little flash, leaving LED off
+  flash(5, 250, 250);
 
   // Re-open the LOCUS file for new data
-  if (!locusFile.open("CURRENT.LOC", O_WRITE | O_CREAT)) {
+  if (!locusFile.open(locusFilename, O_WRITE | O_CREAT)) {
     Log.error("Unable to open LOCUS file CURRENT.LOC" CR);
   }
 
@@ -172,29 +200,46 @@ void loop() {
   Log.trace("loop(): About to sleep, milliseconds: %d" CR, millis());
 
   // make sure files are flushed before going to sleep
-  gpx.flush();
   locusFile.flush();
 
   // now we've handled a batch, sleep until it's next time to unload the LOCUS data
   standBy(LOCUS_BATCH_TIME);
 
   Log.trace("loop(): Wakeup, milliseconds: %d" CR, millis());
+  Log.notice("BATT:,\"%d/%d/%d %d:%d:%d\",%s" CR, 
+             rtc.getYear(), 
+             rtc.getMonth(), 
+             rtc.getDay(), 
+             rtc.getHours(), 
+             rtc.getMinutes(), 
+             rtc.getSeconds(), 
+             dtostrf(checkBattery(), 5, 3, buf));
 
-  // Check for GPS module reset and re-initialise if it has happened
+  // Check for GPS module reset and re-initialise if it has happened *MISSING*
+  //       if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
+  //         // We need to reinitialise the settings
+  //         GPS_setup();
+  //       }
 
   // Loop occurs every wakeup... make sure that we have all in-progress locus data transferred to SD file
   process_locus_data();
 
   Log.trace("loop() exiting" CR);
 
+}
 
-
-    
+void flash(unsigned repeats, unsigned ontime, unsigned offtime) {
+  for (int i=0; i<repeats; i++) {
+    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(ontime);                // wait briefly
+    digitalWrite(13, LOW);
+    delay(offtime);
+  }
 }
 
 // Stop LOCUS logging, copy all of the data from flash to SD file (in NMEA format) then restart LOCUS logging
 void process_locus_data() {
-  int numPoints = 0, numTransferred = 0;
+  int numPoints = 0, recsTransferred = 0;
 
   Log.trace("process_locus_data()" CR);
 
@@ -208,22 +253,15 @@ void process_locus_data() {
     // I would love to check that every valid point is written to file. But 
     // in the circumstances, let's just approximate. If there are n points, 
     // there must be at least n/6 NMEA sentences (since each contains 6 points).
-    if ((numTransferred = append_locus_data_to_file()) > numPoints/6) {
+    if ((recsTransferred = append_locus_data_to_file()) > numPoints/6) {
       
       // Seem to be transferred safely, erase the flash
-      Log.trace("Copied LOCUS data to file, numPoints=%d, numTransferred=%d" CR, numPoints, numTransferred);
+      Log.trace("Copied LOCUS data to file, numPoints=%d, recsTransferred=%d" CR, numPoints, recsTransferred);
       
       GPS.sendCommand(PMTK_LOCUS_ERASE_FLASH);
       
-      // All the data is now safe, give a reassuring little flash
-      for (int i=0; i<5; i++) {
-        digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-        delay(250);                // wait briefly
-        digitalWrite(13, LOW);
-        delay(250);
-      }
     } else {
-      Log.error("Error copying LOCUS data to file, numPoints=%d, numTransferred=%d" CR, numPoints, numTransferred);
+      Log.error("Error copying LOCUS data to file, numPoints=%d, recsTransferred=%d" CR, numPoints, recsTransferred);
     }
   } 
 
@@ -233,60 +271,187 @@ void process_locus_data() {
   
 }
 
-void convert_to_gpx () {
-  Log.trace("convert_to_gps()" CR);
+// read from SD file up to newline or end-of-file. Return num chars read
+int readline(SdFile *sdfile, char *buf, unsigned size) {
+  char *c = buf;
+  int onebyte;
+  int nread = 0;
+
+  Log.trace("readline()" CR);
+  while ( (nread < (size-1)) && ((onebyte=sdfile->read()) >= 0) ) {
+    *c++ = (char)onebyte;
+    nread++;
+    if (onebyte == (int)'\n') {
+      break;
+    }
+  }
+
+  // null-terminate under any circumstances
+  *c = '\0';
+  Log.trace("readline() exiting, nread: %d, onebyte %d, buf: %s" CR, nread, onebyte, buf);
+  return nread;
 }
 
-// void loop() // run over and over again
-// {
+uint8_t checksum(const char *data) {
+  // XOR all the chars in the line except leading $
+  uint8_t check = 0;
+  for (const char *p=&data[1]; *p != '\0'; p++) {
+    check ^= *p;
+  }
+  return check;
+}
+
+// take the first 4 bytes and convert to a 32-bit value
+uint32_t parseLong(uint8_t *byteArray) {
+  uint32_t longValue = byteArray[3]<<24 | byteArray[2]<<16 | byteArray[1]<<8 | byteArray[0];
+  // Log.trace("parseLong returning: %x (%l)" CR, longValue, longValue);
+  return (longValue);
+}
+
+// take the first 2 bytes and convert to a 16-bit value
+int16_t parseInt(uint8_t *byteArray) {
+  int16_t shortValue = byteArray[1]<<8 | byteArray[0];
+  // Log.trace("parseShort returning: %x (%d)" CR, shortValue, shortValue);
+  return (shortValue);
+}
+
+double parseFloat(uint8_t *byteArray) {
+
+  // Log.trace("parseFloat()" CR);
+  uint32_t longValue = parseLong(byteArray);
+
+  // borrowed code from https://github.com/douggilliland/Dougs-Arduino-Stuff/blob/master/Host%20code/parseLOCUS/parseLOCUS.cpp
+  double exponent = ((longValue >> 23) & 0xff); 
+  exponent -= 127.0;
+  exponent = pow(2,exponent);
+  double mantissa = (longValue & 0x7fffff);
+  mantissa = 1.0 + (mantissa/8388607.0);
+  double floatValue = mantissa * exponent;
+  // Log.trace("parseFloat(), high-order bit: %x" CR, (longValue & 0x80000000));
+  // Log.trace("parseFloat(), floatValue before hi-bit test: %s" CR, dtostrf(floatValue, 12, 7, buf));
+  if ((longValue & 0x80000000) > 0)
+    floatValue = -floatValue;
+
+  // Log.trace("parseFloat returning: %s" CR, dtostrf(floatValue, 12, 7, buf));
+  return floatValue; 
+}
+
+boolean parseBasicDataRecord(point *p, uint8_t *byteArray) {
+
+  boolean result = TRUE;
+
+  // for (int i = 0; i < 16; i++) 
+  //   Log.trace("%x ", byteArray[i]);
+  // Log.trace("" CR);
   
-//   // read data from the GPS in the 'main loop'
-//   char c = GPS.read();
-//   // if you want to debug, this is a good time to do it!
-//   if (GPSECHO)
-//     if (c) Serial.print(c);
-//   // if a sentence is received, we can check the checksum, parse it...
-//   if (GPS.newNMEAreceived()) {
-//     Log.trace("Milliseconds: %d" CR, millis());
-//     // a tricky thing here is if we print the NMEA sentence, or data
-//     // we end up not listening and catching other sentences!
-//     // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
-//     Log.notice("%s" CR, GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
+  p->timestamp = parseLong(&byteArray[0]); // caution, trusting parseLong to take just 4 bytes
+  Log.trace("parseBasicDataRecord(), timestamp: %d" CR, p->timestamp);
+  p->fix = byteArray[4];	       // Fix quality: 0 = invalid
+			                           // 1 = GPS fix (SPS)
+                                 // 2 = DGPS fix
+                                 // 3 = PPS fix
+			                           // 4 = Real Time Kinematic
+			                           // 5 = Float RTK
+                                 // 6 = estimated (dead reckoning) (2.3 feature)
+			                           // 7 = Manual input mode
+			                           // 8 = Simulation mode
+  // Log.trace("Fix: %d" CR, p->fix);     
+  p->latitude = parseFloat(&byteArray[5]);
+  p->longitude = parseFloat(&byteArray[9]);
+  p->height = parseInt(&byteArray[13]);
+  // Log.trace("Elevation: %d" CR, p->height);
+
+  // some error conditions that should cause point to be discarded
+  if (p->timestamp > 4290000000) { // December 2105
+    Log.warning("Invalid timestamp: %l" CR, p->timestamp);
+    result = FALSE;
+  } else if ((p->fix == 0) || (p->fix > 4)) {
+    Log.warning("Fix quality invalid: %d" CR, p->fix);
+    result = FALSE;    
+  }
+
+  Log.trace("parseBasicDataRecord(), result: %b" CR, result);
+  return result;
+}
+
+int parseLine(char *lbuf) {
+  int nbytes = 0;  // number of bytes written
+  int npoints = 0; // number of trackpoints written   
+
+  Log.trace("parseLine()" CR);
+
+  if (startsWith("$PMTKLOX,1", lbuf)) {
+
+    // split the checksum from the data body
+    char *data = strtok(lbuf, "*");
+    uint8_t actualChecksum = (uint8_t)strtol(strtok(NULL, "*"), NULL, 16);
+    // Log.trace("data: %s, checksum: %d" CR, data, actualChecksum);
+
+    // calculate our own checksum from the data
+    uint8_t generatedChecksum = checksum(data);
+    if (generatedChecksum != actualChecksum) {
+      Log.error("Checksums don't match, discarding line: actual: %x, generated: %x" CR, actualChecksum, generatedChecksum);
+    } else {
+      // ignore the first three fields
+      (void)strtok(data, ",");	// $PMTLOX
+      (void)strtok(NULL, ",");	// "1"
+      (void)strtok(NULL, ",");	// Record number
+
+      // Now convert the remainder (which should be 24 x 32-bit hex values) to a byte array
+      uint8_t byteArray[24*4];
+      uint8_t *b = byteArray;
+      while (char *hex=strtok(NULL, ",")) {
+      	uint32_t value=strtoul(hex, NULL, 16);
+      	// Log.trace("Long: %l" CR, value);
+      	*b++ = (value&0xFF000000)>>24;
+      	*b++ = (value&0x00FF0000)>>16;
+      	*b++ = (value&0x0000FF00)>>8;
+      	*b++ = (value&0x000000FF);
+      	// Log.trace("Bytes: %x %x %x %x" CR, *(b-4), *(b-3), *(b-2), *(b-1));
+      }
+
+      // Parse in 16 byte chunks
+      unsigned chunkSize = 16;
+      
+      // no protection against called function extending beyond the 6 bytes... this is C!
+      for (int i=0; i<96; i+=chunkSize) {
+      	point p;
+      	if (parseBasicDataRecord(&p, &byteArray[i])) {
+      	  if (write_trkpt_to_gpx(&p) < 0)
+            Log.error("Error writing track point to GPX file, timestamp: %d" CR, p.timestamp);
+          else
+            npoints++;
+      	}
+      }
+    }
+  }
+  Log.trace("parseLine() exiting, npoints: %d" CR, npoints);
+  return (npoints);
+}
+
+void convert_to_gpx() {
+  SdFile locus;	// handle for reading LOCUS file
+  char inbuf[MAXLINELENGTH];
+  int npoints = 0;
+  
+  Log.trace("convert_to_gpx()" CR);
+
+  if (!locus.open("CURRENT.LOC", O_READ)) {
+    Log.error("Unable to open LOCUS file CURRENT.LOC for reading" CR);
+  } else if (create_gpx()) {
+
+    while (readline(&locus, inbuf, sizeof inbuf)) {
+      // process one line of LOCUS output and write it to GPX
+      npoints += parseLine(inbuf);
+    }
     
-//     if (!GPS.parse(GPS.lastNMEA())) // this also sets the newNMEAreceived() flag to false
-//       return; // we can fail to parse a sentence in which case we should just wait for another
-//     else {
+    // write the GPX file tail
+    Log.trace("convert_to_gpx(): about to close_gpx()" CR);
+    close_gpx();
+  }
 
-      
-//       // We have received and parsed a sentence. Does it have date? If we haven't created a dated GPX file, create it now
-//       if (!gpx_open && GPS.fix && GPS.year) {
-//          if (create_gpx ())
-//           gpx_open = TRUE;
-//       	else
-//       	  Log.error("Failed to create GPX file" CR);
-//       }
-
-//       // Now log the new data to the gpx file
-//       if (gpx_open && GPS.fix && startsWith("$GPGGA", GPS.lastNMEA())) {
-//         write_trkpt_to_gpx();
-//       	Log.notice("BATT:,\"%d/%d/%d %d:%d:%d\",%s" CR, 
-//       		   GPS.year, 
-//       		   GPS.month, 
-//       		   GPS.day, 
-//       		   GPS.hour, 
-//       		   GPS.minute, 
-//       		   GPS.seconds, 
-//       		   dtostrf(checkBattery(), 5, 3, buf));
-//       }
-      
-//       if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
-//         // We need to reinitialise the settings
-//         GPS_setup();
-//       }
- 
-//     }
-//   }
-// }
+  Log.trace("convert_to_gpx() exiting, npoints: %d" CR, npoints);
+}
 
 
 int append_locus_data_to_file () {
@@ -294,20 +459,20 @@ int append_locus_data_to_file () {
   int recordsAvailable = 0;
   
   Log.trace("append_locus_data_to_file()" CR);
-  
+
   // Request all the LOCUS data from flash on the GPS module
   GPS.sendCommand(PMTK_Q_LOCUS_DATA_USED);
   if (!GPS.waitForSentence("$PMTKLOX,0")) {
     Log.error("Didn't receive $PMTKLOX,0 as expected, got this instead: %s" CR, GPS.lastNMEA());
   } 
   else {
-    Log.trace(GPS.lastNMEA());
+    // Log.trace(GPS.lastNMEA());
     char *token = strtok(GPS.lastNMEA(), "*,");  // $PMTLOX
-    Log.trace("token: %s" CR, token);
+    // Log.trace("token: %s" CR, token);
     token = strtok(NULL, "*,");             // 0
-    Log.trace("token: %s" CR, token);
+    // Log.trace("token: %s" CR, token);
     token = strtok(NULL, "*,");             // Now we've got the record count
-    Log.trace("token: %s" CR, token);
+    // Log.trace("token: %s" CR, token);
     recordsAvailable = atoi(token);
     Log.trace("recordsAvailable: %d" CR, recordsAvailable);
   }
@@ -340,19 +505,27 @@ int append_locus_data_to_file () {
   return recordsTransferred;
 }
 
-// File create_gpx() {
+boolean create_gpx() {
 
-//   // GPX file header
-//   const char gpxhead[] = "<?xml version=\'1.0\' encoding=\'UTF-8\' standalone=\'yes\' ?>\n<gpx version=\"1.1\"\n creator=\"RMJ-GPXLogger\"\n xmlns=\"http://www.topografix.com/GPX/1/1\"\n xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd\">\n<trk>\n<trkseg>\n";
+  boolean isSuccessful;
 
-//   gpx = sd.open(filename("gpx"), FILE_WRITE);
-//   if (gpx) {
-//     write_to_gpx(gpxhead);
-//   } else {
-//     Log.error("Open file failed: %s" CR, gpx_filename());
-//   }
-//   return (gpx); 
-// }
+  // GPX file header
+  const char gpxhead[] = "<?xml version=\'1.0\' encoding=\'UTF-8\' standalone=\'yes\' ?>\n<gpx version=\"1.1\"\n creator=\"RMJ-GPXLogger\"\n xmlns=\"http://www.topografix.com/GPX/1/1\"\n xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd\">\n<trk>\n<trkseg>\n";
+
+  if (isSuccessful = gpx.open(filename("gpx"), O_WRITE | O_CREAT | O_APPEND)) {
+    gpx.write(gpxhead, strlen(gpxhead));
+  } else {
+    Log.error("Open file failed: %s" CR, filename("gpx"));
+  }
+  return (isSuccessful); 
+}
+
+void close_gpx() {
+  const char gpxtail[] = "</trkseg>\n</trk>\n</gpx>\n";
+
+  gpx.write(gpxtail, strlen(gpxtail));
+  gpx.close();
+}
 
 char *filename(const char *suffix) {
   static char filename[19];  // 15+3 filename and a null terminator
@@ -369,85 +542,33 @@ char *filename(const char *suffix) {
     rtc.getSeconds(), 
     _suffix
     );
-  Log.trace("Filename: %s" CR, filename);
+  
   return(filename);
 }
 
-// void write_trkpt_to_gpx() {
-//   const char trkpt[] = "  <trkpt lat=\"%s\" lon=\"%s\">\n\t<ele>%s</ele>\n\t<time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n  </trkpt>\n";
-//   char s[sizeof(trkpt) + 32];
-//   char lat[16];
-//   char lon[16];
-//   char ele[16];
-//   static uint8_t prev_hour, prev_day = 0;
+int write_trkpt_to_gpx(point *p) {
+  const char trkpt[] = "  <trkpt lat=\"%s\" lon=\"%s\">\n\t<ele>%d</ele>\n\t<time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n  </trkpt>\n";
+  char s[sizeof(trkpt) + 32];
+  char lat[16];
+  char lon[16];
+  char ele[16];
+  TimeElements tm;
 
-//   print_GPS();
-
-//   // there is a situation where the hour has ticked over but the date has not. fix it here.
-//   if (GPS.hour < prev_hour && GPS.day == prev_day) {
-//     GPS.day++;
-//   }
-//   prev_hour = GPS.hour;
-//   prev_day = GPS.day;
-  
-//   sprintf(s, trkpt, 
-//     convert_coord(GPS.latitude, GPS.lat, lat), 
-//     convert_coord(GPS.longitude, GPS.lon, lon), 
-//     dtostrf(GPS.altitude,6,1,ele), 
-//     GPS.year+2000, 
-//     GPS.month, 
-//     GPS.day, 
-//     GPS.hour, 
-//     GPS.minute, 
-//     GPS.seconds);
-//   write_to_gpx(s);
-// }
-
-char *convert_coord(double nmea, char compass, char *s) {
-  unsigned deg = floor(nmea/100);
-  double dec_deg = (nmea - 100*deg) / 60;
-  dec_deg = deg + dec_deg;
-  if (compass == 'S' || compass == 'W') 
-    dec_deg = -1 * dec_deg;
-  s = dtostrf(dec_deg, 12, 7, s);
-  while (*s == ' ')
-    s++;
-  return(s);
+  Log.trace("write_trkpt_to_gpx(): %l" CR, p->timestamp);
+  breakTime(p->timestamp, tm);
+  sprintf(s, trkpt, 
+    dtostrf(p->latitude, 12, 7, lat),
+    dtostrf(p->longitude, 12, 7, lon),
+    p->height, 
+    tm.Year+1970, 
+    tm.Month, 
+    tm.Day, 
+    tm.Hour, 
+    tm.Minute, 
+    tm.Second);
+  return(gpx.write(s, strlen(s)));
+  // Log.trace("write_trkpt_to_gpx() exiting: %s" CR, s);
 }
-
-// void write_to_gpx(const char *s) {
-  
-//   const char gpxtail[] = "</trkseg>\n</trk>\n</gpx>\n";
-//   static uint32_t sizeLessTail = 0;
-//   const unsigned long lenTail = strlen(gpxtail);
-  
-//   if (gpx) {
-//     unsigned long lenS = strlen(s);
-//     boolean truncRC;
-    
-//     truncRC = gpx.truncate(sizeLessTail);
-//     Log.trace("Truncated, size: %d, rc: %d" CR, sizeLessTail, truncRC);    
-//     gpx.write(s, lenS);
-//     Log.trace("Wrote: %d" CR, lenS);
-//     Log.trace(s);
-//     sizeLessTail = gpx.size();
-    
-//     gpx.write(gpxtail, lenTail);
-//     Log.trace("Wrote: %d" CR, lenTail);
-
-//     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-//     delay(50);                // wait briefly
-//     digitalWrite(13, LOW);
-
-//     // now we've got a track point, sleep for 4 seconds
-//     standBy(4);
-    
-//   } else {
-//     Log.error("GPX file not open." CR);
-//   }  
-//   return;
-  
-// }
 
 
 void cardOrSpeed() {
@@ -513,9 +634,6 @@ void SD_setup()
   cout << F("Volume is FAT") << int(sd.vol()->fatType());
   cout << F(", Cluster size (bytes): ") << 512L * sd.vol()->blocksPerCluster();
   cout << endl << endl;
-
-  cout << F("Files found (date time size name):\n");
-  sd.ls(LS_R | LS_DATE | LS_SIZE);
 
   if ((sizeMB > 1100 && sd.vol()->blocksPerCluster() < 64)
       || (sizeMB < 2200 && sd.vol()->fatType() == 32)) {
@@ -609,11 +727,20 @@ void dateTime(uint16_t* date, uint16_t* time) {
 
 void GPS_setup() {
   // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
-  GPS.begin(9600);
+  GPS.begin(57600);
+  // Reboot the GPS module to avoid any output from old LOCUS fetch commands
+  GPS.sendCommand(PMTK_CMD_HOT_START);
+  GPS.waitForSentence("$PMTK010,001");
+
+  // Increase the communication speed with GPS module to get the data quicker
+  // GPS.sendCommand(PMTK_SET_NMEA_BAUDRATE_19200);
+  // GPS.begin(19200);
+  // GPS.waitForSentence("$PMTK001,251");// Confirmation that PMTK_SET_NMEA_BAUDRATE completed
+  
   // Ask for firmware version as handshake
   GPS.sendCommand(PMTK_Q_RELEASE);
   GPS.waitForSentence("$PMTK705");
-  // Now set baud rate to 115200 to speed up receipt of LOCUS data
+
   
 }
 
@@ -656,13 +783,6 @@ void GPS_startLOCUS() {
   delay(1000);
 }
 
-
-
-// int GPS_read_response() {
-//   static char response[256];
-
-//   for (i=0; response[i]=i<
-// }
 
 double checkBattery(){
   //This returns the current voltage of the battery on a Feather 32u4.

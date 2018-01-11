@@ -1,6 +1,8 @@
 # gpslogger-adafruit
 GPS logger using Adafruit M0 Feather Datalogger and GPS Ultimate Featherwing
 
+Credit to Don Coleman (https://github.com/don/locus) for the LOCUS parsing logic.
+
 Notes on LOCUS flash capacity - for the MKT3339 GPS device to autonomously store track points 
 without host microcontroller intervention.
 
