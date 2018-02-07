@@ -19,6 +19,7 @@
 
 #define FALSE 0
 #define TRUE (!FALSE)
+#define EXTLED (18)
 
 // Test with reduced SPI speed for breadboards.  SD_SCK_MHZ(4) will select 
 // the highest speed supported by the board that is not over 4 MHz.
@@ -115,12 +116,12 @@ void alarmMatch();
 void setup()
 {
 
-  // initialize digital pin 13 (red LED) to flash 
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);  // keep it illuminated until we have secured data to SD file
+  // initialize digital pin (external LED) to flash 
+  pinMode(EXTLED, OUTPUT);
+  digitalWrite(EXTLED, HIGH);  // keep it illuminated until we have secured data to SD file
   
   // while (!Serial);   // uncomment to have the sketch wait until Serial is ready
-  // delay(5000);          // Time for USB connection, GPS to finish reboot, etc.
+  delay(1000);          // Time for USB connection, GPS to finish reboot, etc.
   
   // Setup the SD card
   SD_setup();
@@ -153,9 +154,11 @@ void setup()
     Log.error("Unable to open LOCUS file CURRENT.LOC for writing" CR);
   }
   Log.trace("Opened %s, size %d\n" CR, locusFilename, locusFile.fileSize());
+  sdLogger.flush();
 
   // pull any new records off flash and into the current LOCUS file on SD
   process_locus_data();
+  sdLogger.flush();
   locusFile.flush();
 
   // convert the current LOCUS file on SD to GPX
@@ -181,6 +184,7 @@ void setup()
   
   // All the data is now safe, give a reassuring little flash, leaving LED off
   flash(5, 250, 250);
+  sdLogger.flush();
 
   // Re-open the LOCUS file for new data
   if (!locusFile.open(locusFilename, O_WRITE | O_CREAT)) {
@@ -191,7 +195,7 @@ void setup()
   GPS_startLOCUS();
 
   Log.trace("setup() exiting" CR);
-  
+  sdLogger.flush();
   
 }
 
@@ -201,6 +205,7 @@ void loop() {
 
   // make sure files are flushed before going to sleep
   locusFile.flush();
+  sdLogger.flush();
 
   // now we've handled a batch, sleep until it's next time to unload the LOCUS data
   standBy(LOCUS_BATCH_TIME);
@@ -214,6 +219,7 @@ void loop() {
              rtc.getMinutes(), 
              rtc.getSeconds(), 
              dtostrf(checkBattery(), 5, 3, buf));
+  sdLogger.flush();
 
   // Check for GPS module reset and re-initialise if it has happened *MISSING*
   //       if (startsWith("$PMTK010,001", GPS.lastNMEA())) { // GPS device has reset
@@ -225,14 +231,15 @@ void loop() {
   process_locus_data();
 
   Log.trace("loop() exiting" CR);
+  sdLogger.flush();
 
 }
 
 void flash(unsigned repeats, unsigned ontime, unsigned offtime) {
   for (int i=0; i<repeats; i++) {
-    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    digitalWrite(EXTLED, HIGH);   // turn the LED on (HIGH is the voltage level)
     delay(ontime);                // wait briefly
-    digitalWrite(13, LOW);
+    digitalWrite(EXTLED, LOW);
     delay(offtime);
   }
 }
@@ -277,7 +284,7 @@ int readline(SdFile *sdfile, char *buf, unsigned size) {
   int onebyte;
   int nread = 0;
 
-  Log.trace("readline()" CR);
+  // Log.trace("readline()" CR);
   while ( (nread < (size-1)) && ((onebyte=sdfile->read()) >= 0) ) {
     *c++ = (char)onebyte;
     nread++;
@@ -288,7 +295,7 @@ int readline(SdFile *sdfile, char *buf, unsigned size) {
 
   // null-terminate under any circumstances
   *c = '\0';
-  Log.trace("readline() exiting, nread: %d, onebyte %d, buf: %s" CR, nread, onebyte, buf);
+  // Log.trace("readline() exiting, nread: %d, onebyte %d, buf: %s" CR, nread, onebyte, buf);
   return nread;
 }
 
@@ -345,7 +352,7 @@ boolean parseBasicDataRecord(point *p, uint8_t *byteArray) {
   // Log.trace("" CR);
   
   p->timestamp = parseLong(&byteArray[0]); // caution, trusting parseLong to take just 4 bytes
-  Log.trace("parseBasicDataRecord(), timestamp: %d" CR, p->timestamp);
+  // Log.trace("parseBasicDataRecord(), timestamp: %d" CR, p->timestamp);
   p->fix = byteArray[4];	       // Fix quality: 0 = invalid
 			                           // 1 = GPS fix (SPS)
                                  // 2 = DGPS fix
@@ -363,14 +370,14 @@ boolean parseBasicDataRecord(point *p, uint8_t *byteArray) {
 
   // some error conditions that should cause point to be discarded
   if (p->timestamp > 4290000000) { // December 2105
-    Log.warning("Invalid timestamp: %l" CR, p->timestamp);
+    // Log.warning("Invalid timestamp: %l" CR, p->timestamp);
     result = FALSE;
   } else if ((p->fix == 0) || (p->fix > 4)) {
-    Log.warning("Fix quality invalid: %d" CR, p->fix);
+    // Log.warning("Fix quality invalid: %d" CR, p->fix);
     result = FALSE;    
   }
 
-  Log.trace("parseBasicDataRecord(), result: %b" CR, result);
+  // Log.trace("parseBasicDataRecord(), result: %b" CR, result);
   return result;
 }
 
@@ -378,7 +385,7 @@ int parseLine(char *lbuf) {
   int nbytes = 0;  // number of bytes written
   int npoints = 0; // number of trackpoints written   
 
-  Log.trace("parseLine()" CR);
+  // Log.trace("parseLine()" CR);
 
   if (startsWith("$PMTKLOX,1", lbuf)) {
 
@@ -390,7 +397,7 @@ int parseLine(char *lbuf) {
     // calculate our own checksum from the data
     uint8_t generatedChecksum = checksum(data);
     if (generatedChecksum != actualChecksum) {
-      Log.error("Checksums don't match, discarding line: actual: %x, generated: %x" CR, actualChecksum, generatedChecksum);
+      Log.warning("Checksums don't match, discarding line: actual: %x, generated: %x" CR, actualChecksum, generatedChecksum);
     } else {
       // ignore the first three fields
       (void)strtok(data, ",");	// $PMTLOX
@@ -425,7 +432,7 @@ int parseLine(char *lbuf) {
       }
     }
   }
-  Log.trace("parseLine() exiting, npoints: %d" CR, npoints);
+  // Log.trace("parseLine() exiting, npoints: %d" CR, npoints);
   return (npoints);
 }
 
@@ -727,7 +734,7 @@ void dateTime(uint16_t* date, uint16_t* time) {
 
 void GPS_setup() {
   // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
-  GPS.begin(57600);
+  GPS.begin(9600);
   // Reboot the GPS module to avoid any output from old LOCUS fetch commands
   GPS.sendCommand(PMTK_CMD_HOT_START);
   GPS.waitForSentence("$PMTK010,001");
@@ -756,7 +763,6 @@ void GPS_setRTC() {
   GPS.waitForSentence("$PMTK001,220");
   GPS.sendCommand(PMTK_SET_Nav_Speed_0_6);  // Suppress readings where movement is < 0.6 m/s
   GPS.waitForSentence("$PMTK001,386");
-
   
   // $GPRMC appears to emit a plausible date/time even in absence of a proper fix
   // using battery-backed RTC no doubt. So no need to wait for fix. Just check for sane values.
@@ -768,6 +774,7 @@ void GPS_setRTC() {
   rtc.setDate(GPS.day, GPS.month, GPS.year);
   Log.trace("Date from RTS: %d/%d/%d" CR, rtc.getDay(), rtc.getMonth(), rtc.getYear());
   rtc.setTime(GPS.hour, GPS.minute, GPS.seconds);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_OFF);
 }
 
 void GPS_startLOCUS() {
